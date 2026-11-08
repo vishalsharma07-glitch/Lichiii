@@ -1014,6 +1014,9 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     used_pipelines_saved = std::chrono::steady_clock::now();
     size_t skipped_pipelines = 0;
     size_t deferred_pipelines = 0;
+    // Pipelines recorded by another GPU driver (or an older version of this one).
+    size_t foreign_driver_pipelines = 0;
+    size_t foreign_feature_mismatches = 0;
     size_t queued_graphics = 0;
 
     // With the shader precache this boot, the cached graphics pipelines skipped below are built
@@ -1114,6 +1117,22 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
         GraphicsPipelineCacheKey key;
         file.read(reinterpret_cast<char*>(&key), sizeof(key));
         VideoCommon::CheckGraphicsRecord(key.unique_hashes, envs.size());
+        // The key holds the driver that recorded it, but nothing in the pipeline depends on it:
+        // the pipeline is rebuilt from the guest shaders and state with this driver either way.
+        // Re-keying it to this driver lets caches recorded on another GPU vendor (or before a
+        // driver update) be built at boot and found at runtime, instead of being built under a
+        // key this device never looks up.
+        if (key.state.driver_id != dynamic_features.driver_id ||
+            key.state.driver_version != dynamic_features.driver_version) {
+            ++foreign_driver_pipelines;
+            key.state.driver_id = dynamic_features.driver_id;
+            key.state.driver_version = dynamic_features.driver_version;
+            // Nvidia records the EDS2 logic-op bit; drivers without it (AMD on Windows) would
+            // otherwise drop every such pipeline in the feature check below.
+            if (!dynamic_features.has_extended_dynamic_state_2_logic_op) {
+                key.state.extended_dynamic_state_2_logic_op.Assign(0);
+            }
+        }
         const auto record{read_record(file)};
         u64 stages{};
         for (const FileEnvironment& env : envs) {
@@ -1149,6 +1168,7 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
                 dynamic_features.has_color_write_enable ||
             (key.state.dynamic_vertex_input != 0) !=
                 dynamic_features.has_dynamic_vertex_input) {
+            ++foreign_feature_mismatches;
             return;
         }
 
@@ -1251,6 +1271,17 @@ void PipelineCache::LoadDiskResources(u64 title_id, std::stop_token stop_loading
     compute_envs.clear();
 
     LOG_INFO(Render_Vulkan, "Total Pipeline Count: {}", state.total);
+    if (foreign_driver_pipelines != 0) {
+        LOG_INFO(Render_Vulkan, "{} cached graphics pipelines came from another driver",
+                 foreign_driver_pipelines);
+    }
+    if (foreign_feature_mismatches != 0) {
+        LOG_WARNING(Render_Vulkan,
+                    "{} cached graphics pipelines skipped: recorded with different dynamic state "
+                    "settings (match the Extended Dynamic State level and Vertex Input Dynamic "
+                    "State setting of the GPU that recorded the cache to use them)",
+                    foreign_feature_mismatches);
+    }
     if (skipped_pipelines != 0) {
         LOG_INFO(
             Render_Vulkan,
